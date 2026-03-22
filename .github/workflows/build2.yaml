@@ -1,0 +1,119 @@
+name: Build Task Tools (portable)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        project:
+          - name: taskwarrior
+            repo: https://github.com/GothenburgBitFactory/taskwarrior.git
+          - name: timewarrior
+            repo: https://github.com/GothenburgBitFactory/timewarrior.git
+          - name: tasksh
+            repo: https://github.com/GothenburgBitFactory/tasksh.git
+          - name: taskd
+            repo: https://github.com/GothenburgBitFactory/taskd.git
+
+    container:
+      image: ubuntu:20.04
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - uses: jwlawson/actions-setup-cmake@v1
+        with:
+          cmake-version: 3.26.0
+
+      - name: Install dependencies
+        run: |
+          apt update
+          DEBIAN_FRONTEND=noninteractive apt install -y \
+            build-essential \
+            git \
+            curl \
+            pkg-config \
+            libgnutls28-dev \
+            uuid-dev \
+            fakeroot \
+            dpkg-dev
+
+      - name: Install Rust
+        run: |
+          curl https://sh.rustup.rs -sSf | sh -s -- -y
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      # 🔥 Clone project
+      - name: Clone project
+        run: |
+          git clone ${{ matrix.project.repo }}
+
+      # 🔥 Extract version
+      - name: Get version
+        run: |
+          VERSION=$(git -C ${{ matrix.project.name }} describe --tags --always 2>/dev/null || git -C ${{ matrix.project.name }} rev-parse --short HEAD)
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+      # 🔥 Build
+      - name: Build
+        run: |
+          cd ${{ matrix.project.name }}
+          cmake -DCMAKE_BUILD_TYPE=Release .
+          cmake --build . -j$(nproc)
+
+      # 🔥 Install into DESTDIR
+      - name: Install into DESTDIR
+        run: |
+          rm -rf /tmp/pkgroot
+          mkdir -p /tmp/pkgroot
+          cd ${{ matrix.project.name }}
+          make install DESTDIR=/tmp/pkgroot
+
+      # 🔥 Strip binaries
+      - name: Strip binaries
+        run: |
+          find /tmp/pkgroot -type f -executable -exec strip {} + || true
+
+      # 🔥 Create tar.gz
+      - name: Create tar.gz
+        run: |
+          TAR_NAME=${{ matrix.project.name }}-${VERSION}-ubuntu20.tar.gz
+          tar -czf $TAR_NAME -C /tmp/pkgroot .
+          echo "TAR_NAME=$TAR_NAME" >> $GITHUB_ENV
+
+      # 🔥 Create deb
+      - name: Create deb
+        run: |
+          mkdir -p /tmp/deb/DEBIAN
+
+          cat <<EOF > /tmp/deb/DEBIAN/control
+          Package: ${{ matrix.project.name }}
+          Version: ${VERSION}
+          Section: utils
+          Priority: optional
+          Architecture: amd64
+          Maintainer: you <you@example.com>
+          Description: ${{ matrix.project.name }} built via GitHub Actions
+          EOF
+
+          cp -r /tmp/pkgroot/* /tmp/deb/
+          DEB_NAME=${{ matrix.project.name }}-${VERSION}-ubuntu20.deb
+          dpkg-deb --build /tmp/deb $DEB_NAME
+          echo "DEB_NAME=$DEB_NAME" >> $GITHUB_ENV
+
+      # 🔥 Upload artifacts
+      - name: Upload tar
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.TAR_NAME }}
+          path: ${{ env.TAR_NAME }}
+
+      - name: Upload deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.DEB_NAME }}
+          path: ${{ env.DEB_NAME }}

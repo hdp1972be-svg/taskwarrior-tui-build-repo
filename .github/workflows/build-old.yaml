@@ -1,0 +1,159 @@
+# TODO: 
+# - ADD FULL STATIC BUILDING VIA MUSL
+# - CHANGE ORDER OF MOSQUITTO INSTALL AND DO A PUB OF EVERY STEP
+# - ADD AN AUTO README >> tar -tzf taskwarrior-ubuntu20.tar.gz | head -50
+# - ADD NEXT TEXT TO REPO: cat <<EOF > README.md
+
+# # Build Artifact
+# This archive contains files installed via:
+# make install DESTDIR=/tmp/pkgroot
+#
+# ## Contents
+# $(tar -tzf package.tar.gz | head -50)
+# 
+# EOF
+
+# - SEE ALSO OTHER BUILD FILES, ADD TASKWARRIOR, TIMEWARRIOR, BUGWARRIOR, TASKSH, TASKSERVER, TASKD
+
+name: Build taskwarrior-tui (portable)
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    container:
+      image: ubuntu:20.04
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - uses: jwlawson/actions-setup-cmake@v1
+        with:
+          cmake-version: 3.26.0
+
+      # 🔥 Install dependencies
+      - name: Install dependencies
+        run: |
+          apt update
+          DEBIAN_FRONTEND=noninteractive apt install -y \
+            curl \
+            git \
+            build-essential \
+            pkg-config \
+            libssl-dev \
+            fakeroot \
+            dpkg-dev
+
+      # 🔥 Install Rust
+      - name: Install Rust
+        run: |
+          curl https://sh.rustup.rs -sSf | sh -s -- -y
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Show toolchain
+        run: |
+          rustc --version
+          cargo --version
+
+      # 🔥 Clone repo
+      - name: Clone project
+        run: |
+          git clone https://github.com/kdheepak/taskwarrior-tui.git
+
+      # 🔥 Version
+      - name: Get version
+        run: |
+          VERSION=$(git -C taskwarrior-tui describe --tags --always 2>/dev/null || git -C taskwarrior-tui rev-parse --short HEAD)
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+      # 🔥 Build
+      - name: Build
+        run: |
+
+#TODO: Add set -x
+          cd taskwarrior-tui
+          cargo build --release
+
+#TODO:  Add the tee commands below above
+2534   │   cmake -DCMAKE_BUILD_TYPE=Release . | tee build.log
+2535   │   cmake --build . -j$(nproc) | tee -a build.log
+2536   │ ```
+
+      # 🔥 DESTDIR install (manual, since Rust has no make install)
+      - name: Install into DESTDIR
+        run: |
+          rm -rf /tmp/pkgroot
+          mkdir -p /tmp/pkgroot/usr/bin
+          cp taskwarrior-tui/target/release/taskwarrior-tui /tmp/pkgroot/usr/bin/
+
+      # 🔥 Strip binary
+      - name: Strip binary
+        run: |
+          strip /tmp/pkgroot/usr/bin/taskwarrior-tui || true
+
+      # 🔥 Tar package
+      - name: Create tar.gz
+        run: |
+          TAR_NAME=taskwarrior-tui-${VERSION}-ubuntu22.tar.gz
+          tar -czf $TAR_NAME -C /tmp/pkgroot .
+          echo "TAR_NAME=$TAR_NAME" >> $GITHUB_ENV
+
+      # 🔥 Deb package
+      - name: Create deb
+        run: |
+          mkdir -p /tmp/deb/DEBIAN
+
+          cat <<EOF > /tmp/deb/DEBIAN/control
+          Package: taskwarrior-tui
+          Version: ${VERSION}
+          Section: utils
+          Priority: optional
+          Architecture: amd64
+          Maintainer: you <you@example.com>
+          Description: Taskwarrior TUI (Rust) built via GitHub Actions
+          EOF
+
+          cp -r /tmp/pkgroot/* /tmp/deb/
+          DEB_NAME=taskwarrior-tui-${VERSION}-ubuntu22.deb
+          dpkg-deb --build /tmp/deb $DEB_NAME
+          echo "DEB_NAME=$DEB_NAME" >> $GITHUB_ENV
+
+      # 🔥 Upload artifacts
+      - name: Upload tar
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.TAR_NAME }}
+          path: ${{ env.TAR_NAME }}
+
+      - name: Upload deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.DEB_NAME }}
+          path: ${{ env.DEB_NAME }}
+
+      - name: Publish build notification
+        run: |
+    	  sudo apt update && sudo apt install -y mosquitto-clients
+          mosquitto_pub -h test.mosquitto.org -t "ci/taskwarrior-tui/build" \
+             -m "Build $GITHUB_REF $GITHUB_RUN_NUMBER completed with $CONCLUSION"
+
+      - name: Upload Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: package.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+
+258   │ - name: Upload logs
+1259   │   if: always()
+1260   │   uses: actions/upload-artifact@v4
+1261   │   with:
+1262   │     name: logs
+1263   │     path: .

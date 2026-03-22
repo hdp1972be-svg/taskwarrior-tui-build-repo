@@ -1,0 +1,204 @@
+name: Build taskwarrior-tui (multi-variant)
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    container:
+      image: ubuntu:20.04
+
+    steps:
+      - uses: actions/checkout@v3
+
+      # 🧠 Detect tag intent
+      - name: Detect build intent
+        run: |
+          set -euxo pipefail
+
+          TAG="${GITHUB_REF_NAME}"
+
+          if [[ "$TAG" =~ (-s|-static)$ ]]; then
+            echo "PREFERRED=static" >> $GITHUB_ENV
+          else
+            echo "PREFERRED=glibc" >> $GITHUB_ENV
+          fi
+
+          echo "TAG=$TAG" >> $GITHUB_ENV
+
+      # 🔧 Dependencies + MQTT early
+      - name: Install dependencies
+        run: |
+          set -euxo pipefail
+          apt update
+          DEBIAN_FRONTEND=noninteractive apt install -y \
+            curl git build-essential pkg-config \
+            libssl-dev fakeroot dpkg-dev \
+            musl-tools \
+            mosquitto-clients \
+            upx
+
+      # 📡 Notify start
+      - name: Notify start
+        run: |
+          mosquitto_pub -h test.mosquitto.org \
+            -t "ci/taskwarrior-tui/build" \
+            -m "START tag=$TAG run=$GITHUB_RUN_NUMBER preferred=$PREFERRED"
+
+      # 🦀 Rust
+      - name: Install Rust
+        run: |
+          set -euxo pipefail
+          curl https://sh.rustup.rs -sSf | sh -s -- -y
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          source $HOME/.cargo/env
+
+          rustup target add x86_64-unknown-linux-musl
+
+      - name: Toolchain info
+        run: |
+          set -x
+          rustc --version
+          cargo --version
+
+      - name: Notify start
+        run: |
+          mosquitto_pub -h test.mosquitto.org \
+            -t "ci/taskwarrior-tui/build" \
+            -m "RUST INSTALLED run=$GITHUB_RUN_NUMBER"
+
+      # 📦 Clone
+      - name: Clone project
+        run: |
+          set -x
+          git clone https://github.com/kdheepak/taskwarrior-tui.git
+
+      # 🔢 Version
+      - name: Get version
+        run: |
+          set -euxo pipefail
+          VERSION=$(git -C taskwarrior-tui describe --tags --always 2>/dev/null || git -C taskwarrior-tui rev-parse --short HEAD)
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+      # 🧬 Build BOTH variants
+      - name: Build (glibc + musl)
+        run: |
+          set -euxo pipefail
+          cd taskwarrior-tui
+
+          # ---- GLIBC BUILD ----
+          echo ">>> Building GLIBC"
+          RUSTFLAGS="-C link-arg=-s" \
+          cargo build --release 2>&1 | tee build-glibc.log
+
+          # ---- MUSL STATIC BUILD ----
+          echo ">>> Building MUSL STATIC"
+          RUSTFLAGS="-C target-feature=+crt-static" \
+          cargo build --release --target x86_64-unknown-linux-musl \
+          2>&1 | tee build-musl.log
+
+      # 📦 Package function
+      - name: Package artifacts
+        run: |
+          set -euxo pipefail
+
+          mkdir -p /tmp/artifacts
+
+          build_pkg () {
+            VARIANT=$1
+            BIN_PATH=$2
+
+            ROOT=/tmp/pkgroot-$VARIANT
+            rm -rf $ROOT
+            mkdir -p $ROOT/usr/bin
+
+            cp $BIN_PATH $ROOT/usr/bin/taskwarrior-tui
+
+            strip $ROOT/usr/bin/taskwarrior-tui || true
+            upx --best --lzma $ROOT/usr/bin/taskwarrior-tui || true
+
+            TAR=taskwarrior-tui-${VERSION}-${VARIANT}.tar.gz
+            tar -czf $TAR -C $ROOT .
+
+            # README generation
+            tar -tzf $TAR | head -50 > contents.txt
+            cat <<EOF > README-${VARIANT}.md
+# Build Artifact (${VARIANT})
+
+Version: ${VERSION}
+
+## Contents
+$(cat contents.txt)
+
+EOF
+
+            # DEB
+            mkdir -p /tmp/deb-$VARIANT/DEBIAN
+
+            cat <<EOF > /tmp/deb-$VARIANT/DEBIAN/control
+Package: taskwarrior-tui
+Version: ${VERSION}
+Section: utils
+Priority: optional
+Architecture: amd64
+Maintainer: you <you@example.com>
+Description: Taskwarrior TUI (${VARIANT} build)
+EOF
+
+            cp -r $ROOT/* /tmp/deb-$VARIANT/
+
+            DEB=taskwarrior-tui-${VERSION}-${VARIANT}.deb
+            dpkg-deb --build /tmp/deb-$VARIANT $DEB
+
+            mv $TAR /tmp/artifacts/
+            mv $DEB /tmp/artifacts/
+            mv README-${VARIANT}.md /tmp/artifacts/
+          }
+
+          build_pkg "glibc" "taskwarrior-tui/target/release/taskwarrior-tui"
+          build_pkg "static" "taskwarrior-tui/target/x86_64-unknown-linux-musl/release/taskwarrior-tui"
+
+      # 📡 Notify build complete
+      - name: Notify build done
+        run: |
+          mosquitto_pub -h test.mosquitto.org \
+            -t "ci/taskwarrior-tui/build" \
+            -m "BUILD_DONE version=$VERSION"
+
+      # 📤 Upload artifacts
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: taskwarrior-tui-${{ env.VERSION }}
+          path: /tmp/artifacts/*
+
+      # 📤 Upload logs
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs
+          path: |
+            taskwarrior-tui/build-glibc.log
+            taskwarrior-tui/build-musl.log
+
+      # 🚀 Release (all variants)
+      - name: Upload Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: /tmp/artifacts/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # 📡 Final notify
+      - name: Notify done
+        if: always()
+        run: |
+          mosquitto_pub -h test.mosquitto.org \
+            -t "ci/taskwarrior-tui/build" \
+            -m "DONE version=$VERSION preferred=$PREFERRED"
