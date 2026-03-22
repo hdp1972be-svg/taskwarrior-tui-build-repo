@@ -2,55 +2,171 @@ name: Build Lazygit (portable)
 
 on:
   workflow_dispatch:
+  push:
+    tags:
+      - 'lazygit-v*.*.*'
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: write
+
     container:
-      image: ubuntu:20.04
+      image: ubuntu:22.04
+
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      MQTT_HOST: test.mosquitto.org
+      MQTT_TOPIC: ci/lazygit/build
+      PROJECT_NAME: lazygit
+      PROJECT_REPO: https://github.com/jesseduffield/lazygit.git
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-go@v4
-        with:
-          go-version: 1.22.4
-
-      - name: Verify Go install
-        run: go version
+      - name: Prepare workspace
+        run: |
+          set -euxo pipefail
+          rm -rf out logs source /tmp/pkgroot /tmp/debroot /tmp/control /tmp/deb-control
+          mkdir -p out logs
 
       - name: Install dependencies
         run: |
-          apt update
-          DEBIAN_FRONTEND=noninteractive apt install -y \
-            curl \
-            git \
-            make \
-            gcc \
+          set -euxo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
             build-essential \
+            ca-certificates \
+            curl \
+            dpkg-dev \
+            fakeroot \
+            git \
+            mosquitto-clients \
+            tar \
             wget
 
-      - name: Show toolchain versions
+      - name: Resolve version
+        id: version
         run: |
-          go version
-          gcc --version
-          ldd --version
+          set -euxo pipefail
+          git clone --depth 1 "$PROJECT_REPO" source
+          cd source
+          LATEST_TAG="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+          if [[ "${GITHUB_REF:-}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF_NAME#lazygit-}"
+            CHANNEL="release"
+          elif [[ -n "$LATEST_TAG" ]]; then
+            VERSION="${LATEST_TAG}b"
+            CHANNEL="beta"
+          else
+            VERSION="0.0.0b"
+            CHANNEL="beta"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "CHANNEL=$CHANNEL" >> "$GITHUB_ENV"
+
+      - name: Notify start
+        run: |
+          set -euxo pipefail
+          mosquitto_pub -h "$MQTT_HOST" -t "$MQTT_TOPIC" \
+            -m "status=START project=$PROJECT_NAME version=$VERSION channel=$CHANNEL run=$GITHUB_RUN_NUMBER"
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.22.4'
 
       - name: Build Lazygit
         run: |
-          cd lazygit
-          go build -gcflags='all=-N -l' -o lazygit
+          set -euxo pipefail
+          cd source
+          go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o lazygit .
+          go version 2>&1 | tee build.log
+          file lazygit 2>&1 | tee -a build.log
+          mosquitto_pub -h "$MQTT_HOST" -t "$MQTT_TOPIC" \
+            -m "status=BUILT project=$PROJECT_NAME version=$VERSION"
 
-      - name: Package binary
+      - name: Package artifacts
         run: |
-          rm -rf out
-          mkdir out
-          cp lazygit/lazygit ./out/
-          tar -czf lazygit-ubuntu22.tar.gz -C out .
+          set -euxo pipefail
+          rm -rf /tmp/pkgroot /tmp/debroot
+          mkdir -p out logs /tmp/pkgroot/usr/bin /tmp/pkgroot/usr/share/doc/$PROJECT_NAME /tmp/pkgroot/usr/share/$PROJECT_NAME
+          cp source/build.log logs/
+          cp source/lazygit /tmp/pkgroot/usr/bin/
+          strip /tmp/pkgroot/usr/bin/lazygit || true
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+          for doc in README.md LICENSE CHANGELOG.md; do
+            if [[ -f "source/$doc" ]]; then
+              cp "source/$doc" "/tmp/pkgroot/usr/share/doc/$PROJECT_NAME/"
+            fi
+          done
+
+          if [[ -d source/docs ]]; then
+            cp -a source/docs/. "/tmp/pkgroot/usr/share/$PROJECT_NAME/"
+          fi
+
+          tar_name="${PROJECT_NAME}-${VERSION}.tar.gz"
+          deb_name="${PROJECT_NAME}-${VERSION}.deb"
+          tar -czf "out/${tar_name}" -C /tmp/pkgroot .
+
+          printf '%s\n' \
+            "Package: ${PROJECT_NAME}" \
+            "Version: ${VERSION}" \
+            'Section: utils' \
+            'Priority: optional' \
+            'Architecture: amd64' \
+            'Maintainer: ci@example.invalid' \
+            'Description: Lazygit portable package built in GitHub Actions' \
+            > /tmp/deb-control
+
+          rm -rf /tmp/debroot
+          mkdir -p /tmp/debroot/DEBIAN
+          cp /tmp/deb-control /tmp/debroot/DEBIAN/control
+          cp -a /tmp/pkgroot/. /tmp/debroot/
+          dpkg-deb --build /tmp/debroot "out/${deb_name}"
+
+          {
+            echo '# Build Artifact'
+            echo
+            echo "Project: ${PROJECT_NAME}"
+            echo "Version: ${VERSION}"
+            echo
+            echo '## Files'
+            tar -tzf "out/${tar_name}" | head -100
+          } > out/README.md
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
         with:
-          name: lazygit-ubuntu22
-          path: lazygit-ubuntu22.tar.gz
+          name: lazygit-${{ steps.version.outputs.version }}
+          path: out/*
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: lazygit-logs-${{ github.run_number }}
+          path: logs/*
+          if-no-files-found: ignore
+
+      - name: Publish release assets
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Notify completion
+        if: always()
+        run: |
+          set -euxo pipefail
+          mosquitto_pub -h "$MQTT_HOST" -t "$MQTT_TOPIC" \
+            -m "status=${{ job.status }} project=$PROJECT_NAME version=$VERSION channel=$CHANNEL run=$GITHUB_RUN_NUMBER"

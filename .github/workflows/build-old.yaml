@@ -1,159 +1,170 @@
-# TODO: 
-# - ADD FULL STATIC BUILDING VIA MUSL
-# - CHANGE ORDER OF MOSQUITTO INSTALL AND DO A PUB OF EVERY STEP
-# - ADD AN AUTO README >> tar -tzf taskwarrior-ubuntu20.tar.gz | head -50
-# - ADD NEXT TEXT TO REPO: cat <<EOF > README.md
-
-# # Build Artifact
-# This archive contains files installed via:
-# make install DESTDIR=/tmp/pkgroot
-#
-# ## Contents
-# $(tar -tzf package.tar.gz | head -50)
-# 
-# EOF
-
-# - SEE ALSO OTHER BUILD FILES, ADD TASKWARRIOR, TIMEWARRIOR, BUGWARRIOR, TASKSH, TASKSERVER, TASKD
-
-name: Build taskwarrior-tui (portable)
+name: Build taskwarrior-tui (legacy portable)
 
 on:
   workflow_dispatch:
   push:
     tags:
-      - 'v*.*.*'
+      - 'legacy-v*.*.*'
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: write
+
     container:
-      image: ubuntu:20.04
+      image: ubuntu:22.04
+
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      MQTT_HOST: test.mosquitto.org
+      MQTT_TOPIC: ci/taskwarrior-tui/legacy-build
+      PROJECT_NAME: taskwarrior-tui
+      PROJECT_REPO: https://github.com/kdheepak/taskwarrior-tui.git
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v6
 
-      - uses: jwlawson/actions-setup-cmake@v1
-        with:
-          cmake-version: 3.26.0
+      - name: Prepare workspace
+        run: |
+          set -euxo pipefail
+          rm -rf out logs source /tmp/pkgroot /tmp/debroot /tmp/control /tmp/deb-control
+          mkdir -p out logs
 
-      # 🔥 Install dependencies
       - name: Install dependencies
         run: |
-          apt update
-          DEBIAN_FRONTEND=noninteractive apt install -y \
-            curl \
-            git \
+          set -euxo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
             build-essential \
-            pkg-config \
-            libssl-dev \
+            ca-certificates \
+            curl \
+            dpkg-dev \
             fakeroot \
-            dpkg-dev
+            git \
+            libssl-dev \
+            mosquitto-clients \
+            pkg-config
 
-      # 🔥 Install Rust
+      - name: Resolve version
+        id: version
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 "$PROJECT_REPO" source
+          cd source
+          LATEST_TAG="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+          if [[ "${GITHUB_REF:-}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF_NAME#legacy-}"
+            CHANNEL="release"
+          elif [[ -n "$LATEST_TAG" ]]; then
+            VERSION="${LATEST_TAG}b"
+            CHANNEL="beta"
+          else
+            VERSION="0.0.0b"
+            CHANNEL="beta"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "CHANNEL=$CHANNEL" >> "$GITHUB_ENV"
+
+      - name: Notify start
+        run: |
+          set -euxo pipefail
+          mosquitto_pub -h "$MQTT_HOST" -t "$MQTT_TOPIC" \
+            -m "status=START project=$PROJECT_NAME version=$VERSION channel=$CHANNEL run=$GITHUB_RUN_NUMBER"
+
       - name: Install Rust
         run: |
-          curl https://sh.rustup.rs -sSf | sh -s -- -y
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-
-      - name: Show toolchain
-        run: |
+          set -euxo pipefail
+          curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          . "$HOME/.cargo/env"
           rustc --version
           cargo --version
 
-      # 🔥 Clone repo
-      - name: Clone project
+      - name: Build release binary
         run: |
-          git clone https://github.com/kdheepak/taskwarrior-tui.git
+          set -euxo pipefail
+          . "$HOME/.cargo/env"
+          cd source
+          cargo build --release 2>&1 | tee build.log
+          mosquitto_pub -h "$MQTT_HOST" -t "$MQTT_TOPIC" \
+            -m "status=BUILT project=$PROJECT_NAME variant=legacy version=$VERSION"
 
-      # 🔥 Version
-      - name: Get version
+      - name: Package artifacts
         run: |
-          VERSION=$(git -C taskwarrior-tui describe --tags --always 2>/dev/null || git -C taskwarrior-tui rev-parse --short HEAD)
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
-
-      # 🔥 Build
-      - name: Build
-        run: |
-
-#TODO: Add set -x
-          cd taskwarrior-tui
-          cargo build --release
-
-#TODO:  Add the tee commands below above
-2534   │   cmake -DCMAKE_BUILD_TYPE=Release . | tee build.log
-2535   │   cmake --build . -j$(nproc) | tee -a build.log
-2536   │ ```
-
-      # 🔥 DESTDIR install (manual, since Rust has no make install)
-      - name: Install into DESTDIR
-        run: |
-          rm -rf /tmp/pkgroot
-          mkdir -p /tmp/pkgroot/usr/bin
-          cp taskwarrior-tui/target/release/taskwarrior-tui /tmp/pkgroot/usr/bin/
-
-      # 🔥 Strip binary
-      - name: Strip binary
-        run: |
+          set -euxo pipefail
+          rm -rf /tmp/pkgroot /tmp/debroot
+          mkdir -p out logs /tmp/pkgroot/usr/bin /tmp/pkgroot/usr/share/doc/$PROJECT_NAME
+          cp source/build.log logs/
+          cp source/target/release/taskwarrior-tui /tmp/pkgroot/usr/bin/
           strip /tmp/pkgroot/usr/bin/taskwarrior-tui || true
 
-      # 🔥 Tar package
-      - name: Create tar.gz
-        run: |
-          TAR_NAME=taskwarrior-tui-${VERSION}-ubuntu22.tar.gz
-          tar -czf $TAR_NAME -C /tmp/pkgroot .
-          echo "TAR_NAME=$TAR_NAME" >> $GITHUB_ENV
+          for doc in README.md CHANGELOG.md LICENSE LICENSE.md; do
+            if [[ -f "source/$doc" ]]; then
+              cp "source/$doc" "/tmp/pkgroot/usr/share/doc/$PROJECT_NAME/"
+            fi
+          done
 
-      # 🔥 Deb package
-      - name: Create deb
-        run: |
-          mkdir -p /tmp/deb/DEBIAN
+          tar_name="${PROJECT_NAME}-${VERSION}-legacy.tar.gz"
+          deb_name="${PROJECT_NAME}-${VERSION}-legacy.deb"
+          tar -czf "out/${tar_name}" -C /tmp/pkgroot .
 
-          cat <<EOF > /tmp/deb/DEBIAN/control
-          Package: taskwarrior-tui
-          Version: ${VERSION}
-          Section: utils
-          Priority: optional
-          Architecture: amd64
-          Maintainer: you <you@example.com>
-          Description: Taskwarrior TUI (Rust) built via GitHub Actions
-          EOF
+          printf '%s\n' \
+            "Package: ${PROJECT_NAME}" \
+            "Version: ${VERSION}" \
+            'Section: utils' \
+            'Priority: optional' \
+            'Architecture: amd64' \
+            'Maintainer: ci@example.invalid' \
+            'Description: Taskwarrior TUI legacy portable build' \
+            > /tmp/deb-control
 
-          cp -r /tmp/pkgroot/* /tmp/deb/
-          DEB_NAME=taskwarrior-tui-${VERSION}-ubuntu22.deb
-          dpkg-deb --build /tmp/deb $DEB_NAME
-          echo "DEB_NAME=$DEB_NAME" >> $GITHUB_ENV
+          rm -rf /tmp/debroot
+          mkdir -p /tmp/debroot/DEBIAN
+          cp /tmp/deb-control /tmp/debroot/DEBIAN/control
+          cp -a /tmp/pkgroot/. /tmp/debroot/
+          dpkg-deb --build /tmp/debroot "out/${deb_name}"
 
-      # 🔥 Upload artifacts
-      - name: Upload tar
-        uses: actions/upload-artifact@v4
+          {
+            echo '# Build Artifact'
+            echo
+            echo "Version: ${VERSION}"
+            echo
+            echo '## Files'
+            tar -tzf "out/${tar_name}" | head -100
+          } > out/README-legacy.md
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
         with:
-          name: ${{ env.TAR_NAME }}
-          path: ${{ env.TAR_NAME }}
+          name: taskwarrior-tui-legacy-${{ steps.version.outputs.version }}
+          path: out/*
 
-      - name: Upload deb
-        uses: actions/upload-artifact@v4
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v6
         with:
-          name: ${{ env.DEB_NAME }}
-          path: ${{ env.DEB_NAME }}
+          name: taskwarrior-tui-legacy-logs-${{ github.run_number }}
+          path: logs/*
+          if-no-files-found: ignore
 
-      - name: Publish build notification
-        run: |
-    	  sudo apt update && sudo apt install -y mosquitto-clients
-          mosquitto_pub -h test.mosquitto.org -t "ci/taskwarrior-tui/build" \
-             -m "Build $GITHUB_REF $GITHUB_RUN_NUMBER completed with $CONCLUSION"
-
-      - name: Upload Release
+      - name: Publish release assets
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: package.tar.gz
+          files: out/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-
-258   │ - name: Upload logs
-1259   │   if: always()
-1260   │   uses: actions/upload-artifact@v4
-1261   │   with:
-1262   │     name: logs
-1263   │     path: .
+      - name: Notify completion
+        if: always()
+        run: |
+          set -euxo pipefail
+          mosquitto_pub -h "$MQTT_HOST" -t "$MQTT_TOPIC" \
+            -m "status=${{ job.status }} project=$PROJECT_NAME version=$VERSION channel=$CHANNEL run=$GITHUB_RUN_NUMBER"

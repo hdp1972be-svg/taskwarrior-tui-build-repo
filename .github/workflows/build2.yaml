@@ -1,119 +1,216 @@
-name: Build Task Tools (portable)
+name: Build Taskwarrior Suite
 
 on:
   workflow_dispatch:
+  push:
+    tags:
+      - 'suite-v*.*.*'
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: write
+
     strategy:
+      fail-fast: false
       matrix:
         project:
           - name: taskwarrior
             repo: https://github.com/GothenburgBitFactory/taskwarrior.git
+            build_system: cmake
+            binary_glob: usr/local/bin/*
           - name: timewarrior
             repo: https://github.com/GothenburgBitFactory/timewarrior.git
+            build_system: cmake
+            binary_glob: usr/local/bin/*
+          - name: taskserver
+            repo: https://github.com/GothenburgBitFactory/taskserver.git
+            build_system: cmake
+            binary_glob: usr/local/bin/*
+          - name: taskd
+            repo: https://github.com/GothenburgBitFactory/taskserver.git
+            build_system: cmake
+            binary_glob: usr/local/bin/*
           - name: tasksh
             repo: https://github.com/GothenburgBitFactory/tasksh.git
-          - name: taskd
-            repo: https://github.com/GothenburgBitFactory/taskd.git
+            build_system: autotools
+            binary_glob: usr/local/bin/*
 
     container:
-      image: ubuntu:20.04
+      image: ubuntu:22.04
+
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      MQTT_HOST: test.mosquitto.org
+      MQTT_TOPIC: ci/task-tools/build
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v6
 
-      - uses: jwlawson/actions-setup-cmake@v1
-        with:
-          cmake-version: 3.26.0
+      - name: Prepare workspace
+        run: |
+          set -euxo pipefail
+          rm -rf out logs source /tmp/pkgroot /tmp/debroot /tmp/control /tmp/deb-control
+          mkdir -p out logs
 
       - name: Install dependencies
         run: |
-          apt update
-          DEBIAN_FRONTEND=noninteractive apt install -y \
+          set -euxo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            autoconf \
+            automake \
             build-essential \
-            git \
+            ca-certificates \
+            cmake \
             curl \
-            pkg-config \
-            libgnutls28-dev \
-            uuid-dev \
+            dpkg-dev \
             fakeroot \
-            dpkg-dev
+            git \
+            libgnutls28-dev \
+            libssl-dev \
+            libtool \
+            mosquitto-clients \
+            pkg-config \
+            uuid-dev
 
-      - name: Install Rust
+      - name: Clone source
         run: |
-          curl https://sh.rustup.rs -sSf | sh -s -- -y
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          set -euxo pipefail
+          git clone --depth 1 "${{ matrix.project.repo }}" source
 
-      # 🔥 Clone project
-      - name: Clone project
+      - name: Resolve version
+        id: version
         run: |
-          git clone ${{ matrix.project.repo }}
+          set -euxo pipefail
+          cd source
+          LATEST_TAG="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+          if [[ "${GITHUB_REF:-}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF_NAME#suite-}"
+            CHANNEL="release"
+          elif [[ -n "$LATEST_TAG" ]]; then
+            VERSION="${LATEST_TAG}b"
+            CHANNEL="beta"
+          else
+            VERSION="0.0.0b"
+            CHANNEL="beta"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "CHANNEL=$CHANNEL" >> "$GITHUB_ENV"
 
-      # 🔥 Extract version
-      - name: Get version
+      - name: Notify start
         run: |
-          VERSION=$(git -C ${{ matrix.project.name }} describe --tags --always 2>/dev/null || git -C ${{ matrix.project.name }} rev-parse --short HEAD)
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          set -euxo pipefail
+          mosquitto_pub -h "$MQTT_HOST" -t "$MQTT_TOPIC" \
+            -m "status=START project=${{ matrix.project.name }} version=$VERSION channel=$CHANNEL run=$GITHUB_RUN_NUMBER"
 
-      # 🔥 Build
-      - name: Build
+      - name: Build project
         run: |
-          cd ${{ matrix.project.name }}
-          cmake -DCMAKE_BUILD_TYPE=Release .
-          cmake --build . -j$(nproc)
-
-      # 🔥 Install into DESTDIR
-      - name: Install into DESTDIR
-        run: |
+          set -euxo pipefail
+          cd source
           rm -rf /tmp/pkgroot
-          mkdir -p /tmp/pkgroot
-          cd ${{ matrix.project.name }}
-          make install DESTDIR=/tmp/pkgroot
 
-      # 🔥 Strip binaries
-      - name: Strip binaries
+          case "${{ matrix.project.build_system }}" in
+            cmake)
+              mkdir -p build
+              cd build
+              cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local .. 2>&1 | tee ../build.log
+              cmake --build . -j"$(nproc)" 2>&1 | tee -a ../build.log
+              DESTDIR=/tmp/pkgroot cmake --install . 2>&1 | tee -a ../build.log
+              ;;
+            autotools)
+              autoreconf -fi 2>&1 | tee build.log
+              ./configure --prefix=/usr/local 2>&1 | tee -a build.log
+              make -j"$(nproc)" 2>&1 | tee -a build.log
+              make install DESTDIR=/tmp/pkgroot 2>&1 | tee -a build.log
+              ;;
+            *)
+              echo "Unsupported build system: ${{ matrix.project.build_system }}" >&2
+              exit 1
+              ;;
+          esac
+
+          mosquitto_pub -h "$MQTT_HOST" -t "$MQTT_TOPIC" \
+            -m "status=BUILT project=${{ matrix.project.name }} version=$VERSION"
+
+      - name: Package artifacts
         run: |
+          set -euxo pipefail
+          mkdir -p out logs
+          cp source/build.log "logs/${{ matrix.project.name }}.log"
+
           find /tmp/pkgroot -type f -executable -exec strip {} + || true
 
-      # 🔥 Create tar.gz
-      - name: Create tar.gz
-        run: |
-          TAR_NAME=${{ matrix.project.name }}-${VERSION}-ubuntu20.tar.gz
-          tar -czf $TAR_NAME -C /tmp/pkgroot .
-          echo "TAR_NAME=$TAR_NAME" >> $GITHUB_ENV
+          doc_root="/tmp/pkgroot/usr/share/doc/${{ matrix.project.name }}"
+          mkdir -p "$doc_root"
+          for doc in README README.md INSTALL NEWS ChangeLog LICENSE COPYING; do
+            if [[ -f "source/$doc" ]]; then
+              cp "source/$doc" "$doc_root/"
+            fi
+          done
 
-      # 🔥 Create deb
-      - name: Create deb
-        run: |
-          mkdir -p /tmp/deb/DEBIAN
+          tar_name="${{ matrix.project.name }}-${VERSION}.tar.gz"
+          deb_name="${{ matrix.project.name }}-${VERSION}.deb"
+          tar -czf "out/${tar_name}" -C /tmp/pkgroot .
 
-          cat <<EOF > /tmp/deb/DEBIAN/control
-          Package: ${{ matrix.project.name }}
-          Version: ${VERSION}
-          Section: utils
-          Priority: optional
-          Architecture: amd64
-          Maintainer: you <you@example.com>
-          Description: ${{ matrix.project.name }} built via GitHub Actions
-          EOF
+          printf '%s\n' \
+            "Package: ${{ matrix.project.name }}" \
+            "Version: ${VERSION}" \
+            'Section: utils' \
+            'Priority: optional' \
+            'Architecture: amd64' \
+            'Maintainer: ci@example.invalid' \
+            "Description: ${{ matrix.project.name }} packaged from upstream install tree" \
+            > /tmp/control
 
-          cp -r /tmp/pkgroot/* /tmp/deb/
-          DEB_NAME=${{ matrix.project.name }}-${VERSION}-ubuntu20.deb
-          dpkg-deb --build /tmp/deb $DEB_NAME
-          echo "DEB_NAME=$DEB_NAME" >> $GITHUB_ENV
+          rm -rf /tmp/debroot
+          mkdir -p /tmp/debroot/DEBIAN
+          cp /tmp/control /tmp/debroot/DEBIAN/control
+          cp -a /tmp/pkgroot/. /tmp/debroot/
+          dpkg-deb --build /tmp/debroot "out/${deb_name}"
 
-      # 🔥 Upload artifacts
-      - name: Upload tar
-        uses: actions/upload-artifact@v4
+          {
+            echo "# Build Artifact"
+            echo
+            echo "Project: ${{ matrix.project.name }}"
+            echo "Version: ${VERSION}"
+            echo
+            echo '## Files'
+            tar -tzf "out/${tar_name}" | head -100
+          } > "out/README-${{ matrix.project.name }}.md"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
         with:
-          name: ${{ env.TAR_NAME }}
-          path: ${{ env.TAR_NAME }}
+          name: ${{ matrix.project.name }}-${{ steps.version.outputs.version }}
+          path: out/*
 
-      - name: Upload deb
-        uses: actions/upload-artifact@v4
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v6
         with:
-          name: ${{ env.DEB_NAME }}
-          path: ${{ env.DEB_NAME }}
+          name: ${{ matrix.project.name }}-logs-${{ github.run_number }}
+          path: logs/*
+          if-no-files-found: ignore
+
+      - name: Publish release assets
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Notify completion
+        if: always()
+        run: |
+          set -euxo pipefail
+          mosquitto_pub -h "$MQTT_HOST" -t "$MQTT_TOPIC" \
+            -m "status=${{ job.status }} project=${{ matrix.project.name }} version=$VERSION channel=$CHANNEL run=$GITHUB_RUN_NUMBER"
